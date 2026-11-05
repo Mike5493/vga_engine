@@ -82,6 +82,7 @@ main :: proc() {
 	player := Player {
 		x     = fx_from_int(8) + FIXED_HALF,
 		y     = fx_from_int(6) + FIXED_HALF,
+		z     = EYE_HEIGHT,
 		angle = 0,
 	}
 

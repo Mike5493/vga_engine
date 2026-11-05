@@ -32,16 +32,27 @@ TURN_SPEED	  :: Angle(4)
 MOUSE_SENS    :: 100.0          // 1/256 angle units per pixel of mouse movement
 
 // Lighting
-NUM_LEVELS :: 32 // colormap rows: 0 = full bright, 31 = nearly black
-AMBIENT    :: 3  // brightness everywhere, even far from any light
-TORCH_FALL :: 2  // torch brightness lost per tile of distance
-LIGHT_FALL :: 2  // point light brightness lost per tile squared
+NUM_LEVELS  :: 32               // colormap rows: 0 = full bright, 31 = nearly black
+AMBIENT     :: 3                // brightness everywhere, even far from any light
+TORCH_FALL  :: 2                // torch brightness lost per tile of distance
+LIGHT_FALL  :: 2                // point light brightness lost per tile squared
+LIGHT_RANGE :: Fixed(8 << 16)
+
+// Varying height constants
+HEIGHT_SHIFT  :: 13             // heights are in 1/8 tile: raw << 13 = 16.16
+EYE_HEIGHT    :: Fixed(32768)   // 0.5 tile above the floor
+EYE_MARGIN    :: Fixed(6554)    // 0.1 tile: eye stays this far from floor and ceiling
+PLAYER_HEIGHT :: Fixed(39322)   // 0.6 tile: ceiling must clear this to walk in
+MAX_STEP      :: Fixed(16384)   // 0.25 tile: tallest step you can climb
+RISER_TEX     :: 2              // stone for step faces
+LINTEL_TEX    :: 1              // brick for low-ceiling drops
 //odinfmt:enable
 
 Texture :: [TEX_SIZE * TEX_SIZE]u8
 
 Player :: struct {
 	x, y:      Fixed,
+	z:         Fixed, // eye height in the world
 	angle:     Angle,
 	turn_frac: int, // leftover mouse turning, in 1/256 angle units
 }
@@ -77,15 +88,56 @@ map_src := [MAP_H]string{
 	"2222222222222222",
 }
 
+// Floor heights, 1/8 tile per digit. Stairs on the east side, a too-tall bench on row 5.
+floor_src := [MAP_H]string{
+	"0000000000000000",
+	"0000000000000000",
+	"0000000000000000",
+	"0000000000000000",
+	"0000000000000000",
+	"0000000003300000",
+	"0000000000000000",
+	"0000000000000000",
+	"0000000000000000",
+	"0000000000012340",
+	"0000000000002340",
+	"0000000000012340",
+	"0000000000000000",
+	"0000000000000000",
+	"0000000000000000",
+	"0000000000000000",
+}
+
+// Ceiling heights: 0-9 then a=10, b=11, c=12... '8' is the old 1-tile room.
+ceil_src := [MAP_H]string{
+	"8888888888888888",
+	"8888888866666688",
+	"8888888888888888",
+	"8888888888888888",
+	"8888888888888888",
+	"8888888888888888",
+	"8888888888888888",
+	"8888888888888888",
+	"8888888888888888",
+	"8888888888888cc8",
+	"8888888888888cc8",
+	"8888888888888cc8",
+	"8888888888888888",
+	"8888888888888888",
+	"8888444888888888",
+	"8888888888888888",
+}
+
 // Globals
 world_map:  [MAP_H][MAP_W]u8
 textures:   [NUM_TEXTURES]Texture
-column_x:   [VIEW_W]Fixed // camera-plane position of each column, -1..+1
-row_dist:   [VIEW_H]Fixed // distance to the floor under each screen row (lower half used)
+column_x:   [VIEW_W]Fixed            // camera-plane position of each column, -1..+1
+floor_h:    [MAP_H][MAP_W]u8
+ceil_h:     [MAP_H][MAP_W]u8
 colormap:   [NUM_LEVELS][256]u8
 noclip:     bool
 mouse_look: bool = true
-torch_power := 26 		// brightness at the player, 0..31 ([ and ] change it)
+torch_power := 26                    // brightness at the player, 0..31 ([ and ] change it)
 //odinfmt:enable
 
 map_at :: proc(x, y: int) -> u8 {
@@ -174,9 +226,11 @@ init_raycaster :: proc() {
 	make_floor(&textures[TEX_FLOOR])
 	make_ceiling(&textures[TEX_CEIL])
 
-	// Distance to the floor seen through each row's center (eye is at mid-height).
-	for y in VIEW_H / 2 ..< VIEW_H {
-		row_dist[y] = Fixed((PROJ_DIST << FIXED_SHIFT) / (2 * y - VIEW_H + 1))
+	for y in 0 ..< MAP_H {
+		for x in 0 ..< MAP_W {
+			floor_h[y][x] = parse_height(floor_src[y][x])
+			ceil_h[y][x] = parse_height(ceil_src[y][x])
+		}
 	}
 
 	// Pixel-center camera positions, so the view is symetric.
@@ -185,41 +239,26 @@ init_raycaster :: proc() {
 	}
 }
 
-draw_floor_ceiling :: proc(
+// Screen row where world height z appears at distance t, seen from eye height eye.
+proj_y :: proc(z, eye, t: Fixed) -> int {
+	return VIEW_H / 2 - (int(z - eye) * PROJ_DIST) / int(max(t, MIN_DIST))
+}
+
+// A vertical run of wall pixels. Texture rows come from world height,
+// so textures stay anchored across steps.
+draw_wall :: proc(
 	fb: ^Framebuffer,
-	player: ^Player,
-	dir_x, dir_y, plane_x, plane_y: Fixed,
+	x, y0, y1: int,
+	tile: u8,
+	tex_x: int,
+	t, eye: Fixed,
+	lm: ^[256]u8,
 ) {
-	floor_tex := &textures[TEX_FLOOR]
-	ceil_tex := &textures[TEX_CEIL]
-
-	for y in VIEW_H / 2 ..< VIEW_H {
-		dist := row_dist[y]
-		base_b := AMBIENT + torch_light(dist)
-
-		// World position under the leftmost pixel of this row...
-		wx := player.x + fx_mul(dist, dir_x + fx_mul(plane_x, column_x[0]))
-		wy := player.y + fx_mul(dist, dir_y + fx_mul(plane_y, column_x[0]))
-		// ...and how far it moves for each pixel to the right.
-		dx := Fixed(int(fx_mul(dist, plane_x)) * 2 / VIEW_W)
-		dy := Fixed(int(fx_mul(dist, plane_y)) * 2 / VIEW_W)
-
-		row_f := y * SCREEN_W
-		row_c := (VIEW_H - 1 - y) * SCREEN_W // the mirrored row above the horizon
-
-		for x in 0 ..< VIEW_W {
-			tx := (int(wx) >> 10) & (TEX_SIZE - 1) // top 6 bits of the 16-bit fraction
-			ty := (int(wy) >> 10) & (TEX_SIZE - 1)
-			i := ty * TEX_SIZE + tx
-
-			// Torch is per-row, point lights are per-pixel.
-			lm := &colormap[level_for(base_b + light_at(wx, wy))]
-			fb[row_f + x] = lm[floor_tex[i]]
-			fb[row_c + x] = lm[ceil_tex[i]]
-
-			wx += dx
-			wy += dy
-		}
+	tex := &textures[tile]
+	for y in y0 ..< y1 {
+		z := int(eye) - ((2 * y + 1 - VIEW_H) * int(t)) / (2 * PROJ_DIST)
+		tex_y := ((int(FIXED_ONE) - z) >> 10) & (TEX_SIZE - 1)
+		fb[y * SCREEN_W + x] = lm[tex[tex_y * TEX_SIZE + tex_x]]
 	}
 }
 
@@ -270,6 +309,8 @@ light_at :: proc(wx, wy: Fixed) -> int {
 	for l in lights {
 		dx := wx - l.x
 		dy := wy - l.y
+		if abs(dx) > LIGHT_RANGE || abs(dy) > LIGHT_RANGE do continue
+
 		d2 := fx_mul(dx, dy) + fx_mul(dy, dy) // distance squared, in tiles^2
 		total += max(0, l.power - ((int(d2) * LIGHT_FALL) >> FIXED_SHIFT))
 	}
@@ -283,17 +324,43 @@ ray_delta :: proc(ray: Fixed) -> Fixed {
 	return fx_div(FIXED_ONE, a)
 }
 
+// Height helpers
+parse_height :: proc(c: u8) -> u8 {
+	if c >= 'a' do return c - 'a' + 10
+	return c - '0'
+}
+
+cell_floor :: proc(x, y: int) -> Fixed {
+	if x < 0 || x >= MAP_W || y < 0 || y >= MAP_H do return 0
+	return Fixed(int(floor_h[y][x]) << HEIGHT_SHIFT)
+}
+
+cell_ceil :: proc(x, y: int) -> Fixed {
+	if x < 0 || x >= MAP_W || y < 0 || y >= MAP_H do return Fixed(8 << HEIGHT_SHIFT)
+	return Fixed(int(ceil_h[y][x]) << HEIGHT_SHIFT)
+}
+
+// Can the player stand in this cell, coming from a floor at from_floor?
+walkable :: proc(cx, cy: int, from_floor: Fixed) -> bool {
+	if map_at(cx, cy) != 0 do return false
+	f := cell_floor(cx, cy)
+	c := cell_ceil(cx, cy)
+	return f - from_floor <= MAX_STEP && c - f >= PLAYER_HEIGHT
+}
+
 try_move :: proc(player: ^Player, dx, dy: Fixed) {
+	from_floor := cell_floor(fx_to_int(player.x), fx_to_int(player.y))
+
 	// Test each axis separately so we can wall slide!
 	new_x := player.x + dx
 	probe_x := new_x + (PLAYER_RADIUS if dx > 0 else -PLAYER_RADIUS)
-	if map_at(fx_to_int(probe_x), fx_to_int(player.y)) == 0 {
+	if walkable(fx_to_int(probe_x), fx_to_int(player.y), from_floor) {
 		player.x = new_x
 	}
 
 	new_y := player.y + dy
 	probe_y := new_y + (PLAYER_RADIUS if dy > 0 else -PLAYER_RADIUS)
-	if map_at(fx_to_int(player.x), fx_to_int(probe_y)) == 0 {
+	if walkable(fx_to_int(player.x), fx_to_int(probe_y), from_floor) {
 		player.y = new_y
 	}
 }
@@ -357,6 +424,12 @@ update_player :: proc(player: ^Player) {
 		my -= fx_mul(dx, speed)
 	}
 
+	// Ease the eye toward floor + EYE_HEIGHT, but never through floor or ceiling.
+	cell_f := cell_floor(fx_to_int(player.x), fx_to_int(player.y))
+	cell_c := cell_ceil(fx_to_int(player.x), fx_to_int(player.y))
+	player.z += (cell_f + EYE_HEIGHT - player.z) / 4
+	player.z = clamp(player.z, cell_f + EYE_MARGIN, cell_c - EYE_MARGIN)
+
 	if noclip {
 		// Stay inside map bounds, but ignore walls.
 		player.x = clamp(player.x + mx, 0, fx_from_int(MAP_W) - 1)
@@ -372,8 +445,6 @@ render_view :: proc(fb: ^Framebuffer, player: ^Player) {
 	// The camera plane is perpindicular to the view direction.
 	plane_x := fx_mul(-dir_y, PLANE_SCALE)
 	plane_y := fx_mul(dir_x, PLANE_SCALE)
-
-	draw_floor_ceiling(fb, player, dir_x, dir_y, plane_x, plane_y)
 
 	for x in 0 ..< VIEW_W {
 		cam := column_x[x]
