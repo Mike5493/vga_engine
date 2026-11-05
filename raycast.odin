@@ -262,6 +262,34 @@ draw_wall :: proc(
 	}
 }
 
+// A vertical run of floor or ceiling pixels. h is the height difference from the
+// eye; each row's distance follows from it, and the distance gives the world
+// position for texturing and lighting.
+draw_span :: proc(
+	fb: ^Framebuffer,
+	player: ^Player,
+	x: int,
+	ray_x, ray_y: Fixed,
+	y0, y1: int,
+	h: Fixed,
+	ceiling: bool,
+) {
+	tex := &textures[TEX_CEIL if ceiling else TEX_FLOOR]
+	for y in y0 ..< y1 {
+		dy2 := (VIEW_H - 2 * y - 1) if ceiling else (2 * y - VIEW_H + 1)
+		if dy2 < 1 do continue
+
+		t := Fixed((int(h) * 2 * PROJ_DIST) / dy2)
+		wx := player.x + fx_mul(t, ray_x)
+		wy := player.y + fx_mul(t, ray_y)
+		tx := (int(wx) >> 10) & (TEX_SIZE - 1)
+		ty := (int(wy) >> 10) & (TEX_SIZE - 1)
+
+		lm := &colormap[level_for(AMBIENT + torch_light(t) + light_at(wx, wy))]
+		fb[y * SCREEN_W + x] = lm[tex[ty * TEX_SIZE + tx]]
+	}
+}
+
 // Doom-style colormap build: for each light level, darken every palette color
 // and find the closest color the palette actually contains.
 build_colormap :: proc(pal: ^Palette) {
@@ -445,6 +473,7 @@ render_view :: proc(fb: ^Framebuffer, player: ^Player) {
 	// The camera plane is perpindicular to the view direction.
 	plane_x := fx_mul(-dir_y, PLANE_SCALE)
 	plane_y := fx_mul(dir_x, PLANE_SCALE)
+	eye := player.z
 
 	for x in 0 ..< VIEW_W {
 		cam := column_x[x]
@@ -475,61 +504,94 @@ render_view :: proc(fb: ^Framebuffer, player: ^Player) {
 			side_y = fx_mul(fx_from_int(map_y + 1) - player.y, delta_y)
 		}
 
-		// DDA LOOP
-		side := 0 // 0 = hit a vertical line (x side), 1 = horizontal (y side)
-		for map_at(map_x, map_y) == 0 {
+		cur_f := cell_floor(map_x, map_y)
+		cur_c := cell_ceil(map_x, map_y)
+		y_top := 0          // rows above this are done
+		y_bot := VIEW_H     // rows from here down are done
+		t_enter := Fixed(0) // distance where the ray entered the current cell
+
+		for y_top < y_bot {
+			// Next grid line crossing: the far edge of the cell we're in.
+			side := 0
+			t_exit: Fixed
 			if side_x < side_y {
+				t_exit = side_x
 				side_x += delta_x
 				map_x += step_x
-				side = 0
 			} else {
+				t_exit = side_y
 				side_y += delta_y
 				map_y += step_y
 				side = 1
 			}
-		}
-		tile := map_at(map_x, map_y)
+			t_wall := max(t_exit, MIN_DIST)
 
-		// Perpendicular distance (no fisheye, since rays come from a plane)
-		perp := side_x - delta_x if side == 0 else side_y - delta_y
-		perp = max(perp, MIN_DIST)
+			// Floor of the cell we just crossed.
+			y_far := proj_y(cur_f, eye, t_wall)
+			y_near := proj_y(cur_f, eye, t_enter)
+			draw_span(
+				fb,
+				player,
+				x,
+				ray_x,
+				ray_y,
+				max(y_far, y_top),
+				min(y_near, y_bot),
+				eye - cur_f,
+				false,
+			)
+			y_bot = min(y_bot, y_far)
 
-		// Where along the wall did we hit? The fraction picks the texture column.
-		wall: Fixed
-		if side == 0 {
-			wall = player.y + fx_mul(perp, ray_y)
-		} else {
-			wall = player.x + fx_mul(perp, ray_x)
-		}
-		tex_x := (int(wall) & 0xFFFF) >> 10 // 16 bit fraction -> 0..63
-		if (side == 0 && ray_x > 0) || (side == 1 && ray_y < 0) {
-			tex_x = TEX_SIZE - 1 - tex_x // un-mirror textures on these faces
-		}
+			// Ceiling of the cell we just crossed.
+			c_far := proj_y(cur_c, eye, t_wall)
+			c_near := proj_y(cur_c, eye, t_enter)
+			draw_span(
+				fb,
+				player,
+				x,
+				ray_x,
+				ray_y,
+				max(c_near, y_top),
+				min(c_far, y_bot),
+				cur_c - eye,
+				true,
+			)
+			y_top = max(y_top, c_far)
 
-		line_h := max(fx_to_int(fx_div(fx_from_int(PROJ_DIST), perp)), 1)
-		draw_start := VIEW_H / 2 - line_h / 2
+			// Wall geometry at this grid line: texture column and lighting.
+			hit_x := player.x + fx_mul(t_wall, ray_x)
+			hit_y := player.y + fx_mul(t_wall, ray_y)
+			wall_pos := hit_y if side == 0 else hit_x
+			tex_x := (int(wall_pos) >> 10) & (TEX_SIZE - 1)
+			if (side == 0 && ray_x > 0) || (side == 1 && ray_y < 0) {
+				tex_x = TEX_SIZE - 1 - tex_x // un-mirror textures on these faces
+			}
+			lm := &colormap[level_for(AMBIENT + torch_light(t_wall) + light_at(hit_x, hit_y) - side * 3)]
 
-		// Step through the texture in 16.16 as we walk down the screen.
-		step := (TEX_SIZE << FIXED_SHIFT) / line_h
-		tex_pos := 0
-		y0 := draw_start
-		if y0 < 0 {
-			tex_pos = -y0 * step // skip the texture rows that are off-screen
-			y0 = 0
-		}
-		y1 := min(draw_start + line_h, VIEW_H)
+			tile := map_at(map_x, map_y)
+			if tile != 0 {
+				draw_wall(fb, x, y_top, y_bot, tile, tex_x, t_wall, eye, lm)
+				break
+			}
 
-		// Lighting is per-column: torch by distance, point lights at the hit point.
-		hit_x := player.x + fx_mul(perp, ray_x)
-		hit_y := player.y + fx_mul(perp, ray_y)
-		b := AMBIENT + torch_light(perp) + light_at(hit_x, hit_y) - side * 3
-		lm := &colormap[level_for(b)]
+			// Open neighbor: show any step up (riser) or ceiling drop (lintel).
+			next_f := cell_floor(map_x, map_y)
+			next_c := cell_ceil(map_x, map_y)
 
-		tex := &textures[tile]
-		for y in y0 ..< y1 {
-			tex_y := (tex_pos >> FIXED_SHIFT) & (TEX_SIZE - 1)
-			tex_pos += step
-			fb[y * SCREEN_W + x] = lm[tex[tex_y * TEX_SIZE + tex_x]]
+			if next_f > cur_f {
+				r_top := proj_y(next_f, eye, t_wall)
+				draw_wall(fb, x, max(r_top, y_top), y_bot, RISER_TEX, tex_x, t_wall, eye, lm)
+				y_bot = min(y_bot, r_top)
+			}
+			if next_c < cur_c {
+				l_bot := proj_y(next_c, eye, t_wall)
+				draw_wall(fb, x, y_top, min(l_bot, y_bot), LINTEL_TEX, tex_x, t_wall, eye, lm)
+				y_top = max(y_top, l_bot)
+			}
+
+			cur_f = next_f
+			cur_c = next_c
+			t_enter = t_wall
 		}
 	}
 }
