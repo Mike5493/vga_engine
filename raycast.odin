@@ -30,6 +30,11 @@ MOVE_SPEED	  :: Fixed(4096)	// 1/16 tile per frame
 PLAYER_RADIUS :: Fixed(13107)	// 0.2 tile
 TURN_SPEED	  :: Angle(4)
 MOUSE_SENS    :: 100.0          // 1/256 angle units per pixel of mouse movement
+CROUCH_EYE    :: Fixed(16384)   // 0.25 tile: eye height when crouched
+CROUCH_HEIGHT :: Fixed(22938)   // 0.35 tile: clearance needed when crouched
+GRAVITY       :: Fixed(262)		// about 0.004 tile per frame^2
+JUMP_SPEED	  :: Fixed(3709)    // launch speed, peaks around 0.4 tile
+SNAP          :: Fixed(9830)    // 0.15 tile: stay glued to stairs and ramps going down
 
 // Lighting
 NUM_LEVELS  :: 32               // colormap rows: 0 = full bright, 31 = nearly black
@@ -39,13 +44,14 @@ LIGHT_FALL  :: 2                // point light brightness lost per tile squared
 LIGHT_RANGE :: Fixed(8 << 16)
 
 // Varying height constants
-HEIGHT_SHIFT  :: 13             // heights are in 1/8 tile: raw << 13 = 16.16
-EYE_HEIGHT    :: Fixed(32768)   // 0.5 tile above the floor
-EYE_MARGIN    :: Fixed(6554)    // 0.1 tile: eye stays this far from floor and ceiling
-PLAYER_HEIGHT :: Fixed(39322)   // 0.6 tile: ceiling must clear this to walk in
-MAX_STEP      :: Fixed(16384)   // 0.25 tile: tallest step you can climb
-RISER_TEX     :: 2              // stone for step faces
-LINTEL_TEX    :: 1              // brick for low-ceiling drops
+HEIGHT_SHIFT  :: 13               // heights are in 1/8 tile: raw << 13 = 16.16
+EYE_HEIGHT    :: Fixed(32768)     // 0.5 tile above the floor
+EYE_MARGIN    :: Fixed(6554)      // 0.1 tile: eye stays this far from floor and ceiling
+PLAYER_HEIGHT :: Fixed(39322)     // 0.6 tile: ceiling must clear this to walk in
+MAX_STEP      :: Fixed(16384)     // 0.25 tile: tallest step you can climb
+RISER_TEX     :: 2                // stone for step faces
+LINTEL_TEX    :: 1                // brick for low-ceiling drops
+MAX_T         :: Fixed(255 << 16) // clamp for far-away floor hits
 //odinfmt:enable
 
 Texture :: [TEX_SIZE * TEX_SIZE]u8
@@ -53,6 +59,9 @@ Texture :: [TEX_SIZE * TEX_SIZE]u8
 Player :: struct {
 	x, y:      Fixed,
 	z:         Fixed, // eye height in the world
+	feet:      Fixed,
+	vz:        Fixed, // vertial velocity
+	crouching: bool,
 	angle:     Angle,
 	turn_frac: int, // leftover mouse turning, in 1/256 angle units
 }
@@ -66,6 +75,11 @@ lights := [?]Light {
 	{x = 0x38000, y = 0x58000, power = 24}, // (3.5, 5.5)
 	{x = 0xC8000, y = 0xA8000, power = 24}, // (12.5, 10.5)
 	{x = 0x78000, y = 0xD8000, power = 24}, // (7.5, 13.5)
+}
+
+Plane :: struct {
+	z0:     Fixed, // floor height at the cell's top-left corner
+	gx, gy: Fixed, // height gained per tile in x and y
 }
 
 //odinfmt: disable
@@ -97,15 +111,35 @@ floor_src := [MAP_H]string{
 	"0000000000000000",
 	"0000000003300000",
 	"0000000000000000",
-	"0000000000000000",
+	"0024666600000000",
 	"0000000000000000",
 	"0000000000012340",
 	"0000000000002340",
 	"0000000000012340",
 	"0000000000000000",
 	"0000000000000000",
+	"0000000000002220",
 	"0000000000000000",
-	"0000000000000000",
+}
+
+// Direction the floor rises toward: e/w/n/s = 0.25 tile, E/W/N/S = 0.5 tile.
+slope_src := [MAP_H]string{
+	"................",
+	"................",
+	"................",
+	"................",
+	"................",
+	"................",
+	"................",
+	".eee............",
+	"................",
+	"................",
+	"................",
+	"................",
+	"................",
+	"............sss.",
+	"................",
+	"................",
 }
 
 // Ceiling heights: 0-9 then a=10, b=11, c=12... '8' is the old 1-tile room.
@@ -135,6 +169,7 @@ column_x:   [VIEW_W]Fixed            // camera-plane position of each column, -1
 floor_h:    [MAP_H][MAP_W]u8
 ceil_h:     [MAP_H][MAP_W]u8
 colormap:   [NUM_LEVELS][256]u8
+floor_plane: [MAP_H][MAP_W]Plane
 noclip:     bool
 mouse_look: bool = true
 torch_power := 26                    // brightness at the player, 0..31 ([ and ] change it)
@@ -228,8 +263,34 @@ init_raycaster :: proc() {
 
 	for y in 0 ..< MAP_H {
 		for x in 0 ..< MAP_W {
-			floor_h[y][x] = parse_height(floor_src[y][x])
 			ceil_h[y][x] = parse_height(ceil_src[y][x])
+
+			low := Fixed(int(parse_height(floor_src[y][x])) << HEIGHT_SHIFT)
+			c := slope_src[y][x]
+
+			rise := 0
+			switch c {
+			case 'e', 'w', 'n', 's':
+				rise = 2
+			case 'E', 'W', 'N', 'S':
+				rise = 4
+			}
+			g := Fixed(rise << HEIGHT_SHIFT)
+
+			p := Plane {
+				z0 = low,
+			}
+			switch c {
+			case 'e', 'E':
+				p.gx = g
+			case 'w', 'W':
+				p.z0 = low + g; p.gx = -g
+			case 's', 'S':
+				p.gy = g
+			case 'n', 'N':
+				p.z0 = low + g; p.gy = -g
+			}
+			floor_plane[y][x] = p
 		}
 	}
 
@@ -280,6 +341,40 @@ draw_span :: proc(
 		if dy2 < 1 do continue
 
 		t := Fixed((int(h) * 2 * PROJ_DIST) / dy2)
+		wx := player.x + fx_mul(t, ray_x)
+		wy := player.y + fx_mul(t, ray_y)
+		tx := (int(wx) >> 10) & (TEX_SIZE - 1)
+		ty := (int(wy) >> 10) & (TEX_SIZE - 1)
+
+		lm := &colormap[level_for(AMBIENT + torch_light(t) + light_at(wx, wy))]
+		fb[y * SCREEN_W + x] = lm[tex[ty * TEX_SIZE + tx]]
+	}
+}
+
+// A vertical run of floor pixels on cell (cx, cy)'s floor plane, which may slope.
+draw_floor_span :: proc(
+	fb: ^Framebuffer,
+	player: ^Player,
+	x: int,
+	ray_x, ray_y: Fixed,
+	cx, cy, y0, y1: int,
+	eye: Fixed,
+) {
+	tex := &textures[TEX_FLOOR]
+	p := &floor_plane[cy][cx]
+
+	// Eye height above this plane (measured under the player), and how fast the
+	// plane rises per unit of distance along this particular ray.
+	under :=
+		p.z0 + fx_mul(p.gx, player.x - fx_from_int(cx)) + fx_mul(p.gy, player.y - fx_from_int(cy))
+	base := int(eye - under)
+	grad := int(fx_mul(p.gx, ray_x) + fx_mul(p.gy, ray_y))
+
+	for y in y0 ..< y1 {
+		m := ((2 * y - VIEW_H + 1) * 32768) / PROJ_DIST // view ray slope for this row, 16.16
+		den := max(m + grad, 1)
+		t := Fixed(clamp((base << FIXED_SHIFT) / den, 0, int(MAX_T)))
+
 		wx := player.x + fx_mul(t, ray_x)
 		wy := player.y + fx_mul(t, ray_y)
 		tx := (int(wx) >> 10) & (TEX_SIZE - 1)
@@ -358,37 +453,40 @@ parse_height :: proc(c: u8) -> u8 {
 	return c - '0'
 }
 
-cell_floor :: proc(x, y: int) -> Fixed {
-	if x < 0 || x >= MAP_W || y < 0 || y >= MAP_H do return 0
-	return Fixed(int(floor_h[y][x]) << HEIGHT_SHIFT)
-}
 
 cell_ceil :: proc(x, y: int) -> Fixed {
 	if x < 0 || x >= MAP_W || y < 0 || y >= MAP_H do return Fixed(8 << HEIGHT_SHIFT)
 	return Fixed(int(ceil_h[y][x]) << HEIGHT_SHIFT)
 }
 
-// Can the player stand in this cell, coming from a floor at from_floor?
-walkable :: proc(cx, cy: int, from_floor: Fixed) -> bool {
-	if map_at(cx, cy) != 0 do return false
-	f := cell_floor(cx, cy)
-	c := cell_ceil(cx, cy)
-	return f - from_floor <= MAX_STEP && c - f >= PLAYER_HEIGHT
+// Floor height at a world position, using the plane of call (cx, cy).
+floor_z :: proc(cx, cy: int, wx, wy: Fixed) -> Fixed {
+	if cx < 0 || cx >= MAP_W || cy < 0 || cy >= MAP_H do return 0
+	p := &floor_plane[cy][cx]
+	return p.z0 + fx_mul(p.gx, wx - fx_from_int(cx)) + fx_mul(p.gy, wy - fx_from_int(cy))
 }
 
-try_move :: proc(player: ^Player, dx, dy: Fixed) {
-	from_floor := cell_floor(fx_to_int(player.x), fx_to_int(player.y))
+// Can the player stand at this world position, coming from 'from_floor'?
+walkable :: proc(wx, wy: Fixed, feet, height: Fixed) -> bool {
+	cx := fx_to_int(wx)
+	cy := fx_to_int(wy)
+	if map_at(cx, cy) != 0 do return false
+	f := floor_z(cx, cy, wx, wy)
+	c := cell_ceil(cx, cy)
+	return f - feet <= MAX_STEP && c - max(f, feet) >= height
+}
 
+try_move :: proc(player: ^Player, dx, dy, height: Fixed) {
 	// Test each axis separately so we can wall slide!
 	new_x := player.x + dx
 	probe_x := new_x + (PLAYER_RADIUS if dx > 0 else -PLAYER_RADIUS)
-	if walkable(fx_to_int(probe_x), fx_to_int(player.y), from_floor) {
+	if walkable(probe_x, player.y, player.feet, height) {
 		player.x = new_x
 	}
 
 	new_y := player.y + dy
 	probe_y := new_y + (PLAYER_RADIUS if dy > 0 else -PLAYER_RADIUS)
-	if walkable(fx_to_int(player.x), fx_to_int(probe_y), from_floor) {
+	if walkable(player.x, probe_y, player.feet, height) {
 		player.y = new_y
 	}
 }
@@ -396,6 +494,7 @@ try_move :: proc(player: ^Player, dx, dy: Fixed) {
 update_player :: proc(player: ^Player) {
 	// Toggles
 	if rl.IsKeyPressed(.F3) do debug_on = !debug_on
+	if rl.IsKeyPressed(.F4) do crosshair_on = !crosshair_on
 	if rl.IsKeyPressed(.N) do noclip = !noclip
 	toggled_mouse := rl.IsKeyPressed(.M)
 	if toggled_mouse {
@@ -427,6 +526,25 @@ update_player :: proc(player: ^Player) {
 		player.angle += Angle(whole)
 	}
 
+	// Ease the eye toward floor + EYE_HEIGHT, but never through floor or ceiling.
+	cx := fx_to_int(player.x)
+	cy := fx_to_int(player.y)
+	ground := floor_z(cx, cy, player.x, player.y)
+	cell_c := cell_ceil(cx, cy)
+
+	// Crouch (C or Left Ctrl). Releasing only stands player up if there's headroom.
+	if rl.IsKeyDown(.C) || rl.IsKeyDown(.LEFT_CONTROL) {
+		player.crouching = true
+	} else if player.crouching && cell_c - player.feet >= PLAYER_HEIGHT {
+		player.crouching = false
+	}
+	height := CROUCH_HEIGHT if player.crouching else PLAYER_HEIGHT
+
+	// Jump (Space), from the ground only, and not while crouched.
+	if rl.IsKeyPressed(.SPACE) && player.feet <= ground && !player.crouching {
+		player.vz = JUMP_SPEED
+	}
+
 	// Movement
 	speed := MOVE_SPEED
 	if rl.IsKeyDown(.LEFT_SHIFT) do speed *= 2
@@ -452,19 +570,48 @@ update_player :: proc(player: ^Player) {
 		my -= fx_mul(dx, speed)
 	}
 
-	// Ease the eye toward floor + EYE_HEIGHT, but never through floor or ceiling.
-	cell_f := cell_floor(fx_to_int(player.x), fx_to_int(player.y))
-	cell_c := cell_ceil(fx_to_int(player.x), fx_to_int(player.y))
-	player.z += (cell_f + EYE_HEIGHT - player.z) / 4
-	player.z = clamp(player.z, cell_f + EYE_MARGIN, cell_c - EYE_MARGIN)
 
 	if noclip {
 		// Stay inside map bounds, but ignore walls.
 		player.x = clamp(player.x + mx, 0, fx_from_int(MAP_W) - 1)
 		player.y = clamp(player.y + my, 0, fx_from_int(MAP_H) - 1)
 	} else {
-		try_move(player, mx, my)
+		try_move(player, mx, my, height)
 	}
+
+	// Vertical: read the floor and ceiling under the new position.
+	cx = fx_to_int(player.x)
+	cy = fx_to_int(player.y)
+	ground = floor_z(cx, cy, player.x, player.y)
+	cell_c = cell_ceil(cx, cy)
+
+	if player.vz <= 0 && player.feet - ground <= SNAP {
+		player.feet = ground // glued to floor (stairs, ramps, landing)
+		player.vz = 0
+	} else {
+		player.vz -= GRAVITY
+		player.feet += player.vz
+		if player.feet <= ground {
+			player.feet = ground
+			player.vz = 0
+		}
+	}
+
+	// Bonk your head on the ceiling.
+	if player.feet + height > cell_c {
+		player.feet = cell_c - height
+		if player.vz > 0 do player.vz = 0
+	}
+
+	// Eye: smooth when grounded (stairs, crouching), exact while airborne.
+	target := player.feet + (CROUCH_EYE if player.crouching else EYE_HEIGHT)
+	airborne := player.vz != 0 || player.feet - ground > SNAP
+	if airborne {
+		player.z = target
+	} else {
+		player.z += (target - player.z) / 4
+	}
+	player.z = clamp(player.z, ground + EYE_MARGIN, cell_c - EYE_MARGIN)
 }
 
 render_view :: proc(fb: ^Framebuffer, player: ^Player) {
@@ -504,13 +651,15 @@ render_view :: proc(fb: ^Framebuffer, player: ^Player) {
 			side_y = fx_mul(fx_from_int(map_y + 1) - player.y, delta_y)
 		}
 
-		cur_f := cell_floor(map_x, map_y)
+		f_near := floor_z(map_x, map_y, player.x, player.y) // floor height where the ray enters this cell
 		cur_c := cell_ceil(map_x, map_y)
 		y_top := 0          // rows above this are done
 		y_bot := VIEW_H     // rows from here down are done
 		t_enter := Fixed(0) // distance where the ray entered the current cell
 
 		for y_top < y_bot {
+			cx, cy := map_x, map_y // the cell we're leaving
+
 			// Next grid line crossing: the far edge of the cell we're in.
 			side := 0
 			t_exit: Fixed
@@ -526,19 +675,24 @@ render_view :: proc(fb: ^Framebuffer, player: ^Player) {
 			}
 			t_wall := max(t_exit, MIN_DIST)
 
-			// Floor of the cell we just crossed.
-			y_far := proj_y(cur_f, eye, t_wall)
-			y_near := proj_y(cur_f, eye, t_enter)
-			draw_span(
+			hit_x := player.x + fx_mul(t_wall, ray_x)
+			hit_y := player.y + fx_mul(t_wall, ray_y)
+
+			// Floor of the cell we just crossed(may slope, so its far edge has its own height).
+			f_far := floor_z(cx, cy, hit_x, hit_y)
+			y_far := proj_y(f_far, eye, t_wall)
+			y_near := proj_y(f_near, eye, t_enter)
+			draw_floor_span(
 				fb,
 				player,
 				x,
 				ray_x,
 				ray_y,
+				cx,
+				cy,
 				max(y_far, y_top),
 				min(y_near, y_bot),
-				eye - cur_f,
-				false,
+				eye,
 			)
 			y_bot = min(y_bot, y_far)
 
@@ -559,8 +713,6 @@ render_view :: proc(fb: ^Framebuffer, player: ^Player) {
 			y_top = max(y_top, c_far)
 
 			// Wall geometry at this grid line: texture column and lighting.
-			hit_x := player.x + fx_mul(t_wall, ray_x)
-			hit_y := player.y + fx_mul(t_wall, ray_y)
 			wall_pos := hit_y if side == 0 else hit_x
 			tex_x := (int(wall_pos) >> 10) & (TEX_SIZE - 1)
 			if (side == 0 && ray_x > 0) || (side == 1 && ray_y < 0) {
@@ -575,10 +727,10 @@ render_view :: proc(fb: ^Framebuffer, player: ^Player) {
 			}
 
 			// Open neighbor: show any step up (riser) or ceiling drop (lintel).
-			next_f := cell_floor(map_x, map_y)
+			next_f := floor_z(map_x, map_y, hit_x, hit_y)
 			next_c := cell_ceil(map_x, map_y)
 
-			if next_f > cur_f {
+			if next_f > f_far {
 				r_top := proj_y(next_f, eye, t_wall)
 				draw_wall(fb, x, max(r_top, y_top), y_bot, RISER_TEX, tex_x, t_wall, eye, lm)
 				y_bot = min(y_bot, r_top)
@@ -589,7 +741,7 @@ render_view :: proc(fb: ^Framebuffer, player: ^Player) {
 				y_top = max(y_top, l_bot)
 			}
 
-			cur_f = next_f
+			f_near = next_f
 			cur_c = next_c
 			t_enter = t_wall
 		}

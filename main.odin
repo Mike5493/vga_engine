@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import rl "vendor:raylib"
 
 //odinfmt: disable
@@ -63,6 +64,27 @@ present :: proc(fb: ^Framebuffer, pal: ^Palette, out: ^RGBA_Buffer) {
 }
 
 main :: proc() {
+	when TRACK_MEMORY {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
+		tracker = &track
+		defer {
+			for _, leak in track.allocation_map {
+				fmt.eprintf("LEAK: %v bytes, allocated at %v\n", leak.size, leak.location)
+			}
+			for bad in track.bad_free_array {
+				fmt.eprintf("BAD FREE at %v\n", bad.location)
+			}
+			mem.tracking_allocator_destroy(&track)
+			tracker = nil
+		}
+	}
+
+	init_memory()
+	context.temp_allocator = mem.arena_allocator(&frame_arena)
+	perm := mem.arena_allocator(&perm_arena)
+
 	rl.InitWindow(SCREEN_W * SCALE, SCREEN_H * SCALE, "Mode 13h")
 	defer rl.CloseWindow()
 	rl.SetTargetFPS(60)
@@ -70,9 +92,9 @@ main :: proc() {
 
 	scrshot := 0
 
-	fb: Framebuffer
+	fb := new(Framebuffer, perm) // zeroed, and off the stack
+	rgba := new(RGBA_Buffer, perm)
 	pal: Palette
-	rgba: RGBA_Buffer
 
 	build_palette(&pal)
 	build_colormap(&pal)
@@ -93,29 +115,41 @@ main :: proc() {
 	rl.SetTextureFilter(tex, .POINT)
 
 	src := rl.Rectangle{0, 0, SCREEN_W, SCREEN_H}
-	dst := rl.Rectangle{0, 0, SCREEN_W * SCALE, SCREEN_H * SCALE}
 
 	for !rl.WindowShouldClose() {
-		update_player(&player)
-		render_view(&fb, &player)
-		draw_hud(&fb, &player)
+		defer free_all(context.temp_allocator) // frame arena back to empty
 
-		present(&fb, &pal, &rgba)
+		if rl.IsKeyPressed(.F11) do rl.ToggleBorderlessWindowed()
+
+		update_player(&player)
+		render_view(fb, &player)
+		draw_hud(fb, &player)
+
+		present(fb, &pal, rgba)
 
 		if rl.IsKeyPressed(.F12) {
-			img := rl.Image {
-				data    = raw_data(rgba[:]),
+			shot_img := rl.Image {
+				data    = &rgba[0],
 				width   = SCREEN_W,
 				height  = SCREEN_H,
 				mipmaps = 1,
 				format  = .UNCOMPRESSED_R8G8B8A8,
 			}
-			_ = rl.ExportImage(img, fmt.ctprintf("screenshot_%d.png", scrshot))
+			_ = rl.ExportImage(shot_img, fmt.ctprintf("screenshot_%d.png", scrshot))
 			scrshot += 1
 		}
 
-		rl.UpdateTexture(tex, raw_data(rgba[:]))
+		rl.UpdateTexture(tex, &rgba[0])
 
+			//odinfmt:disable
+		// Largest whole-number scale that fits, centered.
+		sw    := int(rl.GetScreenWidth())
+		sh    := int(rl.GetScreenHeight())
+		scale := max(1, min(sw / SCREEN_W, sh / SCREEN_H))
+		dw    := SCREEN_W * scale
+		dh    := SCREEN_H * scale
+		dst   := rl.Rectangle{f32((sw - dw) / 2), f32((sh - dh) / 2), f32(dw), f32(dh)}
+		//odinfmt:enable
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.BLACK)
 		rl.DrawTexturePro(tex, src, dst, {0, 0}, 0, rl.WHITE)

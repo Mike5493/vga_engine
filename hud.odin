@@ -62,6 +62,7 @@ font_glyphs := [?][FONT_W]u8{
 
 debug_on:    bool
 light_popup: int // frames left to show the light level readout
+crosshair_on := true
 //odinfmt:enable
 
 glpyh_index :: proc(ch: u8) -> int {
@@ -109,8 +110,25 @@ frac100 :: proc(a: Fixed) -> int {
 	return ((int(a) & 0xFFFF) * 100) >> FIXED_SHIFT
 }
 
+draw_crosshair :: proc(fb: ^Framebuffer) {
+	cx := VIEW_W / 2
+	cy := VIEW_H / 2
+	for pass in 0 ..< 2 {
+		c := UI_SHADOW if pass == 0 else UI_TEXT
+		o := 1 if pass == 0 else 0
+		for i in 3 ..= 5 {
+			put_pixel(fb, cx - i + o, cy + o, c)
+			put_pixel(fb, cx + i + o, cy + o, c)
+			put_pixel(fb, cx + o, cy - i + o, c)
+			put_pixel(fb, cx + o, cy + i + o, c)
+		}
+	}
+}
+
 draw_hud :: proc(fb: ^Framebuffer, player: ^Player) {
 	buf: [64]u8
+
+	if crosshair_on do draw_crosshair(fb)
 
 	// Light level readout: shows briefly after torch is changed.
 	if light_popup > 0 {
@@ -123,7 +141,7 @@ draw_hud :: proc(fb: ^Framebuffer, player: ^Player) {
 
 	// F3 debug readout.
 	if debug_on {
-		y := SCREEN_H - 40
+		y := SCREEN_H - 50
 		angle := int(player.angle) & ANGLE_MASK
 
 		text := fmt.bprint(
@@ -152,5 +170,24 @@ draw_hud :: proc(fb: ^Framebuffer, player: ^Player) {
 		if noclip {
 			draw_text(fb, 4, y + 27, "NOCLIP", UI_TEXT)
 		}
+
+		if tracker != nil {
+			text = fmt.bprintf(
+				buf[:],
+				"HEAP %d KB  ALLOCS %d",
+				tracker.current_memory_allocated / 1024,
+				tracker.total_allocation_count,
+			)
+			draw_text(fb, 4, y + 36, text, UI_TEXT)
+		}
+
+		text = fmt.bprintf(
+			buf[:],
+			"PERM %d/%d KB  FRAME PEAK %d KB",
+			perm_arena.offset / 1024,
+			PERM_SIZE / 1024,
+			frame_arena.peak_used / 1024,
+		)
+		draw_text(fb, 4, y + 45, text, UI_TEXT)
 	}
 }
